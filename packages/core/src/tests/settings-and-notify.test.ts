@@ -22,6 +22,7 @@ import {
   resolveSettings,
   resolveSettingsSources,
 } from "../settings";
+import { DEFAULT_INTENT_NARRATION_GUARD_SETTINGS } from "../common/intent-narration-guard";
 
 const TEST_PROCESS_ENV = {};
 
@@ -86,6 +87,48 @@ test("resolveSettings defaults multimodal to default", () => {
     TEST_PROCESS_ENV
   );
   assert.equal(resolved.multimodal, "default");
+});
+
+test("resolveSettings enables the intent narration guard with safe defaults", () => {
+  const resolved = resolveSettings(
+    {},
+    { model: "default-model", baseURL: "https://default.example.com" },
+    TEST_PROCESS_ENV
+  );
+
+  assert.deepEqual(resolved.intentNarrationGuard, DEFAULT_INTENT_NARRATION_GUARD_SETTINGS);
+});
+
+test("resolveSettingsSources overrides and extends intent narration phrases", () => {
+  const resolved = resolveSettingsSources(
+    {
+      intentNarrationGuard: {
+        phrases: ["user phrase"],
+        additionalPhrases: ["shared phrase"],
+        hardStopRejections: 5,
+        hardStopWindow: 8,
+      },
+    },
+    {
+      intentNarrationGuard: {
+        phrases: ["project phrase"],
+        additionalPhrases: ["project extension", "shared phrase"],
+        instruction: "Call the tool.",
+        hardStopRejections: 9,
+        hardStopWindow: 7,
+      },
+    },
+    { model: "default-model", baseURL: "https://default.example.com" },
+    { DEEPCODE_INTENT_NARRATION_GUARD_ENABLED: "false" }
+  );
+
+  assert.deepEqual(resolved.intentNarrationGuard, {
+    enabled: false,
+    phrases: ["project phrase", "shared phrase", "project extension"],
+    instruction: "Call the tool.",
+    hardStopRejections: 7,
+    hardStopWindow: 7,
+  });
 });
 
 test("resolveSettings applies Files API defaults", () => {

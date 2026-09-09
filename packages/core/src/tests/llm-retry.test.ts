@@ -5,6 +5,7 @@ import {
   getLlmRetryAfterMs,
   isRetryableLlmError,
   LlmStreamDisconnectedError,
+  LlmStreamFirstChunkTimeoutError,
   LlmStreamIdleTimeoutError,
   waitForLlmRetry,
 } from "../common/llm-retry";
@@ -60,6 +61,7 @@ test("isRetryableLlmError recognizes recoverable HTTP and transport failures", (
     true
   );
   assert.equal(isRetryableLlmError(new LlmStreamIdleTimeoutError()), true);
+  assert.equal(isRetryableLlmError(new LlmStreamFirstChunkTimeoutError()), false);
   assert.equal(isRetryableLlmError(new LlmStreamDisconnectedError()), true);
 });
 

@@ -47,6 +47,16 @@ import {
 } from "./settings";
 import { logApiError } from "./common/error-logger";
 import { logOpenAIChatCompletionDebug, normalizeDebugError } from "./common/debug-logger";
+import {
+  DEFAULT_INTENT_NARRATION_GUARD_SETTINGS,
+  createIntentNarrationRejectionEvent,
+  findIntentNarrationPhrase,
+  logIntentNarrationRejection,
+  recordRejectionInWindow,
+  shouldHardStopIntentNarration,
+  type IntentNarrationRejectionEvent,
+  type ResolvedIntentNarrationGuardSettings,
+} from "./common/intent-narration-guard";
 import { describeLlmError, getLlmErrorDetails } from "./common/llm-error";
 import { killProcessTree } from "./common/process-tree";
 import { GitFileHistory, type FileHistoryCheckpointResult } from "./common/file-history";
@@ -78,8 +88,10 @@ import {
   getLlmRetryDelayMs,
   getLlmRetryAfterMs,
   isRetryableLlmError,
+  LLM_STREAM_FIRST_CHUNK_TIMEOUT_MS,
   LLM_STREAM_IDLE_TIMEOUT_MS,
   LlmStreamDisconnectedError,
+  LlmStreamFirstChunkTimeoutError,
   LlmStreamIdleTimeoutError,
   MAX_LLM_RETRIES,
   waitForLlmRetry,
@@ -288,6 +300,7 @@ export type SessionEntry = {
   askPermissions?: AskPermissionRequest[];
   planMode?: boolean;
   pluginRateLimitedTool?: PluginRateLimitedTool;
+  intentNarrationRejections?: number;
   forkedFrom?: {
     sessionId: string;
     messageId: string;
@@ -379,12 +392,14 @@ export type SessionManagerOptions = {
     mcpServers?: Record<string, McpServerConfig>;
     permissions?: Required<PermissionSettings>;
     enabledSkills?: Record<string, boolean>;
+    intentNarrationGuard?: ResolvedIntentNarrationGuardSettings;
   };
   renderMarkdown: (text: string) => string;
   onAssistantMessage: (message: SessionMessage, shouldConnect: boolean) => void;
   onSessionEntryUpdated?: (entry: SessionEntry) => void;
   onLlmStreamProgress?: (progress: LlmStreamProgress) => void;
   onLlmRetry?: (event: LlmRetryEvent) => void;
+  onIntentNarrationRejected?: (event: IntentNarrationRejectionEvent) => void;
   onMcpStatusChanged?: () => void;
   onProcessStdout?: (pid: number, chunk: string) => void;
   loadSharp?: SharpLoader;
@@ -428,11 +443,13 @@ export class SessionManager {
     mcpServers?: Record<string, McpServerConfig>;
     permissions?: Required<PermissionSettings>;
     enabledSkills?: Record<string, boolean>;
+    intentNarrationGuard?: ResolvedIntentNarrationGuardSettings;
   };
   private readonly onAssistantMessage: (message: SessionMessage, shouldConnect: boolean) => void;
   private readonly onSessionEntryUpdated?: (entry: SessionEntry) => void;
   private readonly onLlmStreamProgress?: (progress: LlmStreamProgress) => void;
   private readonly onLlmRetry?: (event: LlmRetryEvent) => void;
+  private readonly onIntentNarrationRejected?: (event: IntentNarrationRejectionEvent) => void;
   private readonly onMcpStatusChanged?: () => void;
   private readonly onProcessStdout?: (pid: number, chunk: string) => void;
   private readonly nonInteractive: boolean;
@@ -456,6 +473,7 @@ export class SessionManager {
     this.onSessionEntryUpdated = options.onSessionEntryUpdated;
     this.onLlmStreamProgress = options.onLlmStreamProgress;
     this.onLlmRetry = options.onLlmRetry;
+    this.onIntentNarrationRejected = options.onIntentNarrationRejected;
     this.onMcpStatusChanged = options.onMcpStatusChanged;
     this.onProcessStdout = options.onProcessStdout;
     this.nonInteractive = options.nonInteractive === true;
@@ -742,7 +760,7 @@ export class SessionManager {
 
     const outerSignal = options?.signal as AbortSignal | undefined;
     const attemptController = new AbortController();
-    let idleTimedOut = false;
+    let timeoutError: Error | null = null;
     let idleTimer: ReturnType<typeof setTimeout> | null = null;
     let idleTimeoutPromise: Promise<never>;
     const forwardAbort = () => attemptController.abort(outerSignal?.reason);
@@ -753,17 +771,17 @@ export class SessionManager {
       }
       outerSignal?.removeEventListener("abort", forwardAbort);
     };
-    const resetIdleTimer = () => {
+    const resetIdleTimer = (timeoutMs: number, createError: () => Error) => {
       if (idleTimer) {
         clearTimeout(idleTimer);
       }
       idleTimeoutPromise = new Promise((_, reject) => {
         idleTimer = setTimeout(() => {
-          idleTimedOut = true;
-          const error = new LlmStreamIdleTimeoutError();
+          const error = createError();
+          timeoutError = error;
           attemptController.abort(error);
           reject(error);
-        }, LLM_STREAM_IDLE_TIMEOUT_MS);
+        }, timeoutMs);
       });
     };
     if (outerSignal?.aborted) {
@@ -771,7 +789,7 @@ export class SessionManager {
     } else {
       outerSignal?.addEventListener("abort", forwardAbort, { once: true });
     }
-    resetIdleTimer();
+    resetIdleTimer(LLM_STREAM_FIRST_CHUNK_TIMEOUT_MS, () => new LlmStreamFirstChunkTimeoutError());
     const attemptOptions = { ...options, signal: attemptController.signal, maxRetries: 0 };
 
     const streamRequest = {
@@ -795,7 +813,7 @@ export class SessionManager {
         idleTimeoutPromise!,
       ]);
     } catch (error) {
-      const requestError = idleTimedOut ? new LlmStreamIdleTimeoutError() : error;
+      const requestError = timeoutError ?? error;
       this.logChatCompletionDebug(debug, {
         timestamp: new Date().toISOString(),
         location: debug?.location ?? "SessionManager.createChatCompletionStream:create",
@@ -875,7 +893,7 @@ export class SessionManager {
           break;
         }
         const chunk = item.value;
-        resetIdleTimer();
+        resetIdleTimer(LLM_STREAM_IDLE_TIMEOUT_MS, () => new LlmStreamIdleTimeoutError());
         if (debug?.enabled) {
           responseChunks.push(chunk);
         }
@@ -946,7 +964,7 @@ export class SessionManager {
         throw new LlmStreamDisconnectedError();
       }
     } catch (error) {
-      const streamError = idleTimedOut ? new LlmStreamIdleTimeoutError() : error;
+      const streamError = timeoutError ?? error;
       this.logChatCompletionDebug(debug, {
         timestamp: new Date().toISOString(),
         location: debug?.location ?? "SessionManager.createChatCompletionStream:stream",
@@ -1496,6 +1514,7 @@ ${agentInstructions}
       usage: null,
       usagePerModel: null,
       activeTokens: 0,
+      intentNarrationRejections: 0,
       createTime: now,
       updateTime: now,
       processes: null,
@@ -1719,6 +1738,7 @@ ${agentInstructions}
     try {
       const maxIterations = 80000; // about 1K RMB cost
       let toolCalls: unknown[] | null = null;
+      let intentNarrationHistory: boolean[] = [];
 
       for (let iteration = 0; iteration < maxIterations; iteration++) {
         if (this.isInterrupted(sessionId)) {
@@ -1734,7 +1754,8 @@ ${agentInstructions}
           this.listSessionMessages(sessionId)
         );
         if (pendingToolCallMessage.toolCalls.length > 0) {
-          const toolAppendResult = await this.appendToolMessages(sessionId, pendingToolCallMessage.toolCalls, {
+          const pendingToolCalls = pendingToolCallMessage.toolCalls.slice(0, 1);
+          const toolAppendResult = await this.appendToolMessages(sessionId, pendingToolCalls, {
             permissionOverrides: permissionPrompt?.permissions,
             messagePermissions: pendingToolCallMessage.message?.meta?.permissions,
           });
@@ -1747,7 +1768,7 @@ ${agentInstructions}
           if (toolAppendResult.waitingForUser) {
             this.updateSessionEntry(sessionId, (entry) => ({
               ...entry,
-              toolCalls: pendingToolCallMessage.toolCalls,
+              toolCalls: pendingToolCalls,
               status: "waiting_for_user",
               updateTime: new Date().toISOString(),
             }));
@@ -1849,6 +1870,62 @@ ${agentInstructions}
 
         if (this.isInterrupted(sessionId)) {
           return;
+        }
+        const intentNarrationGuard =
+          this.getResolvedSettings().intentNarrationGuard ?? DEFAULT_INTENT_NARRATION_GUARD_SETTINGS;
+        const matchedIntentPhrase = findIntentNarrationPhrase(content, Boolean(toolCalls), intentNarrationGuard);
+        intentNarrationHistory = recordRejectionInWindow(
+          intentNarrationHistory,
+          Boolean(matchedIntentPhrase),
+          intentNarrationGuard.hardStopWindow
+        );
+        if (matchedIntentPhrase) {
+          const responseUsage = response.usage ?? null;
+          const hardStopped = shouldHardStopIntentNarration(intentNarrationHistory, intentNarrationGuard);
+          const failReason = hardStopped
+            ? `Intent narration guard stopped the run after ${intentNarrationHistory.filter(Boolean).length} rejected turns within the last ${intentNarrationGuard.hardStopWindow} model turns.`
+            : null;
+          const updatedEntry = this.updateSessionEntry(sessionId, (entry) => ({
+            ...entry,
+            assistantReply: hardStopped ? failReason : intentNarrationGuard.instruction,
+            assistantThinking: thinking,
+            assistantRefusal: refusal,
+            toolCalls: null,
+            usage: accumulateUsage(entry.usage, responseUsage),
+            usagePerModel: accumulateUsagePerModel(entry.usagePerModel, model, responseUsage),
+            activeTokens: getTotalTokens(responseUsage),
+            status: hardStopped ? "failed" : "processing",
+            failReason,
+            askPermissions: undefined,
+            intentNarrationRejections: (entry.intentNarrationRejections ?? 0) + 1,
+            updateTime: new Date().toISOString(),
+          }));
+          const event = createIntentNarrationRejectionEvent({
+            content,
+            sessionId,
+            stepId: `${sessionId}:${iteration + 1}`,
+            matchedPhrase: matchedIntentPhrase,
+            totalRejections: updatedEntry?.intentNarrationRejections ?? 1,
+            rejectionHistory: intentNarrationHistory,
+            windowSize: intentNarrationGuard.hardStopWindow,
+            hardStopped,
+          });
+          logIntentNarrationRejection(event);
+          this.onIntentNarrationRejected?.(event);
+
+          const correctionMessage = this.buildSystemMessage(sessionId, intentNarrationGuard.instruction, null, true, {
+            asThinking: true,
+          });
+          this.appendSessionMessage(sessionId, correctionMessage);
+          this.onAssistantMessage(correctionMessage, true);
+
+          if (hardStopped) {
+            const failureMessage = this.buildAssistantMessage(sessionId, failReason, null);
+            this.appendSessionMessage(sessionId, failureMessage);
+            this.onAssistantMessage(failureMessage, false);
+            return;
+          }
+          continue;
         }
         const assistantMessage = this.buildAssistantMessage(sessionId, content, toolCalls, thinking);
         const permissionPlan = toolCalls
@@ -2295,6 +2372,7 @@ ${agentInstructions}
       usage: null,
       usagePerModel: null,
       activeTokens: source.activeTokens,
+      intentNarrationRejections: 0,
       createTime: now,
       updateTime: now,
       processes: null,
@@ -2989,22 +3067,23 @@ ${agentInstructions}
       return null;
     }
 
-    return rawToolCalls.map((toolCall) => {
-      if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) {
-        return toolCall;
-      }
+    const [toolCall] = rawToolCalls;
+    if (!toolCall || typeof toolCall !== "object" || Array.isArray(toolCall)) {
+      return [toolCall];
+    }
 
-      const record = toolCall as Record<string, unknown>;
-      const id = typeof record.id === "string" ? record.id.trim() : "";
-      if (id) {
-        return toolCall;
-      }
+    const record = toolCall as Record<string, unknown>;
+    const id = typeof record.id === "string" ? record.id.trim() : "";
+    if (id) {
+      return [toolCall];
+    }
 
-      return {
+    return [
+      {
         ...record,
         id: this.generateToolCallId(),
-      };
-    });
+      },
+    ];
   }
 
   private buildToolMessage(
@@ -3099,6 +3178,7 @@ ${agentInstructions}
       shouldStop: () => this.isInterrupted(sessionId),
     };
     const parsedToolCalls = toolCalls
+      .slice(0, 1)
       .map((toolCall) => parseToolCallForPermissions(toolCall))
       .filter((toolCall): toolCall is PermissionToolCall => Boolean(toolCall));
     const toolExecutions: ToolCallExecution[] = [];
@@ -3575,6 +3655,10 @@ ${agentInstructions}
       askPermissions: normalizeAskPermissions(value.askPermissions),
       planMode: value.planMode === true,
       pluginRateLimitedTool: this.normalizePluginRateLimitedTool(value.pluginRateLimitedTool),
+      intentNarrationRejections:
+        typeof value.intentNarrationRejections === "number" && value.intentNarrationRejections >= 0
+          ? Math.floor(value.intentNarrationRejections)
+          : 0,
       forkedFrom: this.normalizeForkedFrom(value.forkedFrom),
     };
   }

@@ -39,6 +39,16 @@ export type {
   ResolvedStatusLineSettings,
   StatusLineProviderConfig,
 } from "./settings";
+export type {
+  IntentNarrationGuardSettings,
+  IntentNarrationRejectionEvent,
+  ResolvedIntentNarrationGuardSettings,
+} from "./common/intent-narration-guard";
+export {
+  DEFAULT_INTENT_NARRATION_GUARD_SETTINGS,
+  DEFAULT_INTENT_NARRATION_INSTRUCTION,
+  DEFAULT_INTENT_NARRATION_PHRASES,
+} from "./common/intent-narration-guard";
 
 // Session
 export { SessionManager, getProjectCode, getCompactPromptTokenThreshold } from "./session";

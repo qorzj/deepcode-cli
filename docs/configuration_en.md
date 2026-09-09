@@ -48,6 +48,7 @@ The following are all the top-level fields supported in `settings.json`, along w
 | `permissions`      | object  | Permission policy and additional `addWorkingDirs` workspace roots (see [permission_en.md](./permission_en.md)) |
 | `enabledSkills`    | object  | Per-skill enable/disable map, keyed by skill name                           |
 | `statusline`       | object  | Status line plugins (see [statusline_en.md](./statusline_en.md))            |
+| `intentNarrationGuard` | object | Reject prose-only intent turns and cap repeated stalls (enabled by default) |
 
 #### `env` Sub-fields
 
@@ -62,6 +63,7 @@ The following are all the top-level fields supported in `settings.json`, along w
 | `MULTIMODAL`      | string | Multimodal (image) capability override: `"default"`, `"on"`, or `"off"` |
 | `DEBUG_LOG_ENABLED`| string| Enable debug log output                                         |
 | `TELEMETRY_ENABLED`| string| Enable anonymous usage reporting                                |
+| `INTENT_NARRATION_GUARD_ENABLED` | string | Enable or disable the intent narration guard         |
 | `<any other KEY>` | string | Custom environment variable                                     |
 
 #### Context Windows
@@ -175,6 +177,27 @@ Controls whether skills are included during skill scanning. Keys are resolved sk
 - Missing entries are enabled by default.
 - Setting a skill to `false` hides every skill with that resolved `name`, across project and user skill roots.
 - Project settings override user settings per skill. If the project setting omits a skill, the user setting is used.
+
+#### `intentNarrationGuard` — Prose-only Stall Protection
+
+Deep Code enforces one tool call per model step. If a model returns a recognized intent phrase without a tool call, the turn is discarded and replaced with a short corrective system instruction. Prose accompanied by a real tool call passes unchanged. By default, four rejected turns in the last six model turns fail the run instead of allowing an unbounded loop.
+
+```json
+{
+  "intentNarrationGuard": {
+    "enabled": true,
+    "additionalPhrases": ["about to invoke"],
+    "instruction": "No prose intent. Emit the tool call now.",
+    "hardStopRejections": 4,
+    "hardStopWindow": 6
+  }
+}
+```
+
+- `phrases` replaces the built-in phrase list; `additionalPhrases` extends it.
+- Set `hardStopRejections` to `0` to disable only the hard cap.
+- Rejections increment `SessionEntry.intentNarrationRejections` and are logged to `~/.deepcode/logs/intent-narration.log` with the step ID, a SHA-256 text hash, and a truncated preview.
+- `DEEPCODE_INTENT_NARRATION_GUARD_ENABLED=false` disables the guard for a process without editing settings files.
 
 #### `mcpServers` — MCP Servers
 

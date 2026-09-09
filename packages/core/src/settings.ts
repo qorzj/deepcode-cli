@@ -2,6 +2,11 @@ import { DEEPSEEK_V4_MODELS, defaultsToThinkingMode, type MultimodalMode } from 
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import {
+  DEFAULT_INTENT_NARRATION_GUARD_SETTINGS,
+  type IntentNarrationGuardSettings,
+  type ResolvedIntentNarrationGuardSettings,
+} from "./common/intent-narration-guard";
 
 export type DeepcodingEnv = Record<string, string | undefined> & {
   MODEL?: string;
@@ -107,6 +112,7 @@ export type DeepcodingSettings = {
   permissions?: PermissionSettings;
   enabledSkills?: EnabledSkillsSettings;
   statusline?: StatusLineSettings;
+  intentNarrationGuard?: IntentNarrationGuardSettings;
 };
 
 export type ResolvedDeepcodingSettings = {
@@ -134,6 +140,7 @@ export type ResolvedDeepcodingSettings = {
   permissions: Required<PermissionSettings>;
   enabledSkills: EnabledSkillsSettings;
   statusline: ResolvedStatusLineSettings;
+  intentNarrationGuard: ResolvedIntentNarrationGuardSettings;
 };
 
 export type ModelConfigSelection = {
@@ -248,6 +255,63 @@ function firstIntegerInRange(minimum: number, maximum: number, ...values: unknow
 
 function trimString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function normalizeStringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const result: string[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    const phrase = trimString(item);
+    const key = phrase.toLowerCase();
+    if (!phrase || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(phrase);
+  }
+  return result;
+}
+
+function mergeIntentNarrationGuard(
+  userSettings: DeepcodingSettings | null | undefined,
+  projectSettings: DeepcodingSettings | null | undefined,
+  systemEnv: Record<string, string>
+): ResolvedIntentNarrationGuardSettings {
+  const userGuard = userSettings?.intentNarrationGuard;
+  const projectGuard = projectSettings?.intentNarrationGuard;
+  const basePhrases =
+    normalizeStringArray(projectGuard?.phrases) ??
+    normalizeStringArray(userGuard?.phrases) ??
+    DEFAULT_INTENT_NARRATION_GUARD_SETTINGS.phrases;
+  const additionalPhrases = [
+    ...(normalizeStringArray(userGuard?.additionalPhrases) ?? []),
+    ...(normalizeStringArray(projectGuard?.additionalPhrases) ?? []),
+  ];
+  const phrases = normalizeStringArray([...basePhrases, ...additionalPhrases]) ?? [];
+  const hardStopWindow =
+    firstIntegerInRange(1, 100, projectGuard?.hardStopWindow, userGuard?.hardStopWindow) ??
+    DEFAULT_INTENT_NARRATION_GUARD_SETTINGS.hardStopWindow;
+  const configuredHardStopRejections =
+    firstIntegerInRange(0, 100, projectGuard?.hardStopRejections, userGuard?.hardStopRejections) ??
+    DEFAULT_INTENT_NARRATION_GUARD_SETTINGS.hardStopRejections;
+
+  return {
+    enabled:
+      parseBoolean(systemEnv.INTENT_NARRATION_GUARD_ENABLED) ??
+      parseBoolean(projectGuard?.enabled) ??
+      parseBoolean(userGuard?.enabled) ??
+      DEFAULT_INTENT_NARRATION_GUARD_SETTINGS.enabled,
+    phrases,
+    instruction:
+      trimString(projectGuard?.instruction) ||
+      trimString(userGuard?.instruction) ||
+      DEFAULT_INTENT_NARRATION_GUARD_SETTINGS.instruction,
+    hardStopRejections: configuredHardStopRejections === 0 ? 0 : Math.min(configuredHardStopRejections, hardStopWindow),
+    hardStopWindow,
+  };
 }
 
 const VALID_PERMISSION_SCOPES = new Set<PermissionScope>([
@@ -723,6 +787,7 @@ export function resolveSettingsSources(
     permissions: mergePermissions(userSettings, projectSettings),
     enabledSkills: mergeEnabledSkills(userSettings, projectSettings),
     statusline: mergeStatusLine(userSettings, projectSettings),
+    intentNarrationGuard: mergeIntentNarrationGuard(userSettings, projectSettings, systemEnv),
   };
 }
 

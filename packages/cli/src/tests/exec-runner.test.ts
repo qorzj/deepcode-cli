@@ -42,6 +42,13 @@ function createSettings(
     permissions,
     enabledSkills: {},
     statusline: { enabled: false, refreshMs: 1000, separator: " | ", providers: [] },
+    intentNarrationGuard: {
+      enabled: true,
+      phrases: ["let me run"],
+      instruction: "No prose intent. Emit the tool call now.",
+      hardStopRejections: 4,
+      hardStopWindow: 6,
+    },
   };
 }
 

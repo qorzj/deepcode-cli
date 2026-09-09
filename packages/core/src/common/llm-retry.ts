@@ -2,6 +2,7 @@ import { getLlmErrorDetails } from "./llm-error";
 
 export const MAX_LLM_RETRIES = 5;
 export const LLM_STREAM_IDLE_TIMEOUT_MS = 60_000;
+export const LLM_STREAM_FIRST_CHUNK_TIMEOUT_MS = 300_000;
 
 const BASE_RETRY_DELAY_MS = 800;
 const RETRYABLE_NETWORK_CODES = new Set([
@@ -18,9 +19,16 @@ const RETRYABLE_NETWORK_CODES = new Set([
 ]);
 
 export class LlmStreamIdleTimeoutError extends Error {
-  constructor() {
-    super(`Model stream was idle for ${LLM_STREAM_IDLE_TIMEOUT_MS / 1000} seconds.`);
+  constructor(timeoutMs: number = LLM_STREAM_IDLE_TIMEOUT_MS) {
+    super(`Model stream was idle for ${timeoutMs / 1000} seconds.`);
     this.name = "LlmStreamIdleTimeoutError";
+  }
+}
+
+export class LlmStreamFirstChunkTimeoutError extends Error {
+  constructor(timeoutMs: number = LLM_STREAM_FIRST_CHUNK_TIMEOUT_MS) {
+    super(`Model stream produced no first chunk for ${timeoutMs / 1000} seconds.`);
+    this.name = "LlmStreamFirstChunkTimeoutError";
   }
 }
 
@@ -57,6 +65,12 @@ export function getLlmRetryAfterMs(error: unknown, now: number = Date.now()): nu
 }
 
 export function isRetryableLlmError(error: unknown): boolean {
+  // A first-chunk timeout commonly means an expensive local-model prefill is
+  // still running. Replaying the same large prompt multiplies work without
+  // improving recovery, so fail once and let route/fallback policy take over.
+  if (error instanceof LlmStreamFirstChunkTimeoutError) {
+    return false;
+  }
   if (error instanceof LlmStreamIdleTimeoutError || error instanceof LlmStreamDisconnectedError) {
     return true;
   }

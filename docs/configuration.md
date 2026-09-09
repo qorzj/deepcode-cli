@@ -48,6 +48,7 @@ Deep Code 使用 `settings.json` 设置文件进行持久化配置，支持两�
 | `permissions`        | object    | 权限策略及 `addWorkingDirs` 额外工作目录配置（参见 [permission.md](./permission.md)） |
 | `enabledSkills`      | object    | 按 skill 名称启用或禁用 skill 的配置                                 |
 | `statusline`         | object    | 状态栏插件配置(参见 [statusline.md](./statusline.md))               |
+| `intentNarrationGuard` | object | 拒绝只有执行意图、没有工具调用的回合，并限制重复停滞（默认启用）       |
 
 #### `env` 子字段
 
@@ -62,6 +63,7 @@ Deep Code 使用 `settings.json` 设置文件进行持久化配置，支持两�
 | `MULTIMODAL`  | string | 多模态（图片）能力开关，可选 `"default"`、`"on"` 或 `"off"`         |
 | `DEBUG_LOG_ENABLED`  | string | 是否启用调试日志输出                                     |
 | `TELEMETRY_ENABLED`  | string | 是否启用匿名使用数据上报                                   |
+| `INTENT_NARRATION_GUARD_ENABLED` | string | 是否启用执行意图防停滞保护                    |
 | `<其他任意KEY>` | string | 自定义环境变量 |
 
 #### 上下文窗口
@@ -175,6 +177,27 @@ Deep Code 使用 `settings.json` 设置文件进行持久化配置，支持两�
 - 未配置的 skill 默认启用。
 - 将某个 skill 设置为 `false` 后，所有项目级和用户级目录中解析名称相同的 skill 都会被隐藏。
 - 项目设置会按 skill 覆盖用户设置。如果项目设置没有配置某个 skill，则使用用户设置。
+
+#### `intentNarrationGuard` — 纯意图文本防停滞保护
+
+Deep Code 每个模型步骤最多执行一个工具调用。如果模型返回了已识别的执行意图短语，却没有工具调用，该回合会被丢弃并替换为简短的系统纠正指令。包含真实工具调用的文本回合不受影响。默认情况下，最近六个模型回合中出现四个被拒绝回合时，运行会明确失败，避免无限循环。
+
+```json
+{
+  "intentNarrationGuard": {
+    "enabled": true,
+    "additionalPhrases": ["马上调用"],
+    "instruction": "No prose intent. Emit the tool call now.",
+    "hardStopRejections": 4,
+    "hardStopWindow": 6
+  }
+}
+```
+
+- `phrases` 替换内置短语列表；`additionalPhrases` 在内置列表上扩展。
+- 将 `hardStopRejections` 设为 `0` 仅关闭硬停止上限。
+- 每次拒绝都会累加 `SessionEntry.intentNarrationRejections`，并在 `~/.deepcode/logs/intent-narration.log` 中记录步骤 ID、文本 SHA-256 哈希和截断预览。
+- 可设置 `DEEPCODE_INTENT_NARRATION_GUARD_ENABLED=false`，在不修改设置文件的情况下为当前进程关闭保护。
 
 #### `mcpServers` — MCP 服务器
 

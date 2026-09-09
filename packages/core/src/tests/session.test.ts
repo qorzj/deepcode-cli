@@ -924,7 +924,7 @@ test("skill tool stores the full document and metadata in its tool message", asy
   assert.match(missing.error ?? "", /Unknown skill: not-a-real-skill/);
 });
 
-test("skill tool avoids duplicate loads within the same tool call batch", async () => {
+test("appendToolMessages executes only the first tool in a batch", async () => {
   const workspace = createTempDir("deepcode-skill-batch-dedupe-workspace-");
   const home = createTempDir("deepcode-skill-batch-dedupe-home-");
   setHomeDir(home);
@@ -946,9 +946,8 @@ test("skill tool avoids duplicate loads within the same tool call batch", async 
     .listSessionMessages(sessionId)
     .filter((message) => message.role === "tool")
     .map((message) => JSON.parse(message.content ?? "{}"));
-  assert.equal(results.length, 2);
+  assert.equal(results.length, 1);
   assert.match(results[0]?.output ?? "", /<skill_content name="skill-writer"/);
-  assert.equal(results[1]?.output, "Skill already loaded: skill-writer.");
   assert.equal(countLoadedSkillMessages(manager.listSessionMessages(sessionId), "skill-writer"), 1);
 });
 
@@ -3225,7 +3224,130 @@ test("ReadImage tool params show a workspace-relative file path", () => {
   assert.equal(toolMessage.meta?.paramsMd, path.join("images", "screenshot.png"));
 });
 
-test("LLM tool calls without ids receive generated 32 character ids", async () => {
+test("SessionManager rejects prose-only intent, retries, and allows the same prose with a tool call", async () => {
+  const workspace = createTempDir("deepcode-intent-guard-workspace-");
+  const home = createTempDir("deepcode-intent-guard-home-");
+  setHomeDir(home);
+
+  const filePath = path.join(workspace, "note.txt");
+  fs.writeFileSync(filePath, "guarded\n", "utf8");
+  const responses = [
+    createChatResponse("Let me run it now.", { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }),
+    {
+      choices: [
+        {
+          message: {
+            content: "Let me run it now.",
+            tool_calls: [
+              {
+                id: "call-read-after-rejection",
+                type: "function",
+                function: { name: "read", arguments: JSON.stringify({ file_path: filePath }) },
+              },
+            ],
+          },
+        },
+      ],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    },
+    createChatResponse("Done.", { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 }),
+  ];
+  const events: Array<{ stepId: string; hardStopped: boolean }> = [];
+  let chatCalls = 0;
+  const client = {
+    chat: {
+      completions: {
+        create: async () => {
+          chatCalls += 1;
+          const response = responses.shift();
+          assert.ok(response, "expected a queued chat response");
+          return response;
+        },
+      },
+    },
+  };
+  const manager = new SessionManager({
+    projectRoot: workspace,
+    createOpenAIClient: () => ({
+      client: client as any,
+      model: "test-model",
+      baseURL: "https://api.deepseek.com",
+      thinkingEnabled: false,
+    }),
+    getResolvedSettings: () => ({
+      model: "test-model",
+      intentNarrationGuard: {
+        enabled: true,
+        phrases: ["let me run"],
+        instruction: "No prose intent. Emit the tool call now.",
+        hardStopRejections: 4,
+        hardStopWindow: 6,
+      },
+    }),
+    renderMarkdown: (text) => text,
+    onAssistantMessage: () => {},
+    onIntentNarrationRejected: (event) => events.push(event),
+  });
+
+  const sessionId = await manager.createSession({ text: "" });
+  const messages = manager.listSessionMessages(sessionId);
+  const matchingAssistantMessages = messages.filter(
+    (message) => message.role === "assistant" && message.content === "Let me run it now."
+  );
+  const correction = messages.find(
+    (message) => message.role === "system" && message.content === "No prose intent. Emit the tool call now."
+  );
+  const toolMessage = messages.find(
+    (message) =>
+      message.role === "tool" &&
+      (message.messageParams as { tool_call_id?: string } | null)?.tool_call_id === "call-read-after-rejection"
+  );
+
+  assert.equal(chatCalls, 3);
+  assert.equal(matchingAssistantMessages.length, 1, "the rejected prose turn must not be persisted");
+  assert.equal(correction?.visible, true);
+  assert.match(toolMessage?.content ?? "", /guarded/);
+  assert.equal(manager.getSession(sessionId)?.intentNarrationRejections, 1);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]?.stepId, `${sessionId}:1`);
+  assert.equal(events[0]?.hardStopped, false);
+  assert.equal(manager.getSession(sessionId)?.status, "completed");
+
+  const logLines = fs
+    .readFileSync(path.join(home, ".deepcode", "logs", "intent-narration.log"), "utf8")
+    .trim()
+    .split("\n");
+  const logEntry = JSON.parse(logLines[0] ?? "{}") as Record<string, unknown>;
+  assert.match(String(logEntry.textHash), /^sha256:[0-9a-f]{64}$/);
+  assert.equal(logEntry.textPreview, "Let me run it now.");
+  assert.equal(logEntry.stepId, `${sessionId}:1`);
+});
+
+test("SessionManager hard-stops repeated intent narration at four of the last six turns", async () => {
+  const workspace = createTempDir("deepcode-intent-cap-workspace-");
+  const home = createTempDir("deepcode-intent-cap-home-");
+  setHomeDir(home);
+
+  const responses = Array.from({ length: 4 }, () =>
+    createChatResponse("Let me run the check now.", { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 })
+  );
+  const manager = createMockedClientSessionManager(workspace, responses);
+  const sessionId = await manager.createSession({ text: "" });
+  const session = manager.getSession(sessionId);
+
+  assert.equal(responses.length, 0);
+  assert.equal(session?.status, "failed");
+  assert.equal(session?.intentNarrationRejections, 4);
+  assert.match(session?.failReason ?? "", /4 rejected turns within the last 6 model turns/);
+  assert.equal(
+    manager
+      .listSessionMessages(sessionId)
+      .filter((message) => message.content === "No prose intent. Emit the tool call now.").length,
+    4
+  );
+});
+
+test("LLM tool calls without ids are limited to one action per step", async () => {
   const workspace = createTempDir("deepcode-tool-call-id-workspace-");
   const home = createTempDir("deepcode-tool-call-id-home-");
   setHomeDir(home);
@@ -3269,10 +3391,8 @@ test("LLM tool calls without ids receive generated 32 character ids", async () =
     .find((message) => message.role === "assistant" && (message.messageParams as any)?.tool_calls);
   const toolCalls = (assistantMessage?.messageParams as { tool_calls?: Array<{ id?: unknown }> } | null)?.tool_calls;
 
-  assert.equal(toolCalls?.length, 2);
+  assert.equal(toolCalls?.length, 1);
   assert.match(String(toolCalls?.[0]?.id), /^[0-9a-f]{32}$/);
-  assert.match(String(toolCalls?.[1]?.id), /^[0-9a-f]{32}$/);
-  assert.notEqual(toolCalls?.[0]?.id, toolCalls?.[1]?.id);
 
   const toolMessages = manager.listSessionMessages(sessionId).filter((message) => message.role === "tool");
   assert.deepEqual(
@@ -3280,9 +3400,8 @@ test("LLM tool calls without ids receive generated 32 character ids", async () =
     toolCalls?.map((toolCall) => toolCall.id)
   );
 
-  const readToolMessage = toolMessages.find((message) => JSON.parse(message.content ?? "{}").name === "read");
-  assert.equal((readToolMessage?.meta?.function as { name?: string } | undefined)?.name, "read");
-  assert.equal(readToolMessage?.meta?.paramsMd, "note.txt");
+  assert.equal(toolMessages.length, 1);
+  assert.equal((toolMessages[0]?.meta?.function as { name?: string } | undefined)?.name, "UpdatePlan");
 });
 
 test("buildOpenAIMessages repairs mixed missing duplicate and orphan tool messages", () => {
@@ -3823,10 +3942,11 @@ test("SessionManager treats a clean EOF without a terminal chunk as a disconnect
   assert.equal(retryError, "Model stream disconnected before completion.");
 });
 
-test("SessionManager retries a stream after sixty seconds without data", async (t) => {
+test("SessionManager retries a stream that is idle for sixty seconds after its first chunk", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const controller = new AbortController();
   let retryError = "";
+  let nextCall = 0;
   const client = {
     chat: {
       completions: {
@@ -3835,6 +3955,13 @@ test("SessionManager retries a stream after sixty seconds without data", async (
             return this;
           },
           next() {
+            nextCall += 1;
+            if (nextCall === 1) {
+              return Promise.resolve({
+                done: false,
+                value: { choices: [{ delta: { content: "partial" } }] },
+              });
+            }
             return new Promise<IteratorResult<unknown>>(() => {});
           },
         }),
@@ -3858,11 +3985,62 @@ test("SessionManager retries a stream after sixty seconds without data", async (
     { model: "test-model" },
     { signal: controller.signal }
   );
-  await Promise.resolve();
+  for (let turn = 0; turn < 10 && nextCall < 2; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(nextCall, 2);
   t.mock.timers.tick(60_000);
+  await Promise.resolve();
 
   await assert.rejects(responsePromise, (error: Error) => error.name === "AbortError");
   assert.equal(retryError, "Model stream was idle for 60 seconds.");
+});
+
+test("SessionManager gives first-chunk prefill five minutes and does not replay it after timeout", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  let retries = 0;
+  let nextCalls = 0;
+  const client = {
+    chat: {
+      completions: {
+        create: async () => ({
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+          next() {
+            nextCalls += 1;
+            return new Promise<IteratorResult<unknown>>(() => {});
+          },
+        }),
+      },
+    },
+  };
+  const manager = new SessionManager({
+    projectRoot: process.cwd(),
+    createOpenAIClient: () => ({ client: client as any, model: "test-model", thinkingEnabled: false }),
+    getResolvedSettings: () => ({ model: "test-model" }),
+    renderMarkdown: (text) => text,
+    onAssistantMessage: () => {},
+    onLlmRetry: () => {
+      retries += 1;
+    },
+  });
+
+  const responsePromise = (manager as any).createChatCompletionStream(client, { model: "test-model" });
+  for (let turn = 0; turn < 10 && nextCalls < 1; turn += 1) {
+    await Promise.resolve();
+  }
+  assert.equal(nextCalls, 1);
+  t.mock.timers.tick(300_000);
+  await Promise.resolve();
+
+  await assert.rejects(
+    responsePromise,
+    (error: Error) =>
+      error.name === "LlmStreamFirstChunkTimeoutError" &&
+      error.message === "Model stream produced no first chunk for 300 seconds."
+  );
+  assert.equal(retries, 0);
 });
 
 test("SessionManager persists session and user message before skill matching is cancelled", async () => {
@@ -4599,6 +4777,7 @@ test("SessionManager.forkSession copies conversation state with fresh usage and 
   assert.equal(forked.usage, null);
   assert.equal(forked.usagePerModel, null);
   assert.equal(forked.activeTokens, 15);
+  assert.equal(forked.intentNarrationRejections, 0);
   assert.equal(forked.status, "completed");
   assert.equal(forked.failReason, null);
   assert.equal(forked.assistantRefusal, null);
