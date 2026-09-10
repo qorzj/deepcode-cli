@@ -232,6 +232,47 @@ test("resolveSettings gives top-level model priority over env MODEL", () => {
   assert.equal(resolved.model, "deepseek-v4-flash");
 });
 
+test("resolveSettings uses Atlas Cloud defaults with ATLASCLOUD_API_KEY", () => {
+  const resolved = resolveSettings(
+    {},
+    {
+      model: "default-model",
+      baseURL: "https://default.example.com",
+    },
+    {
+      ATLASCLOUD_API_KEY: "atlas-test-key",
+    }
+  );
+
+  assert.equal(resolved.apiKey, "atlas-test-key");
+  assert.equal(resolved.baseURL, "https://api.atlascloud.ai/v1");
+  assert.equal(resolved.model, "deepseek-ai/deepseek-v4-pro");
+  assert.equal(resolved.thinkingEnabled, true);
+});
+
+test("resolveSettings gives explicit API settings priority over Atlas Cloud defaults", () => {
+  const resolved = resolveSettings(
+    {
+      env: {
+        API_KEY: "explicit-key",
+        BASE_URL: "https://explicit.example.com/v1",
+        MODEL: "explicit-model",
+      },
+    },
+    {
+      model: "default-model",
+      baseURL: "https://default.example.com",
+    },
+    {
+      ATLASCLOUD_API_KEY: "atlas-test-key",
+    }
+  );
+
+  assert.equal(resolved.apiKey, "explicit-key");
+  assert.equal(resolved.baseURL, "https://explicit.example.com/v1");
+  assert.equal(resolved.model, "explicit-model");
+});
+
 test("resolveSettings derives model-specific context window defaults", () => {
   const regular = resolveSettings(
     {},

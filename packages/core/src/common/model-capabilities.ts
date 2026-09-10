@@ -1,4 +1,9 @@
-export const DEEPSEEK_V4_MODELS = new Set(["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp"]);
+export const DEEPSEEK_V4_MODELS = new Set([
+  "deepseek-v4-flash",
+  "deepseek-v4-pro",
+  "deepseek-v4-flash-vision-exp",
+  "deepseek-ai/deepseek-v4-pro",
+]);
 
 export type MultimodalMode = "default" | "on" | "off";
 
